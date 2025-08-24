@@ -13,6 +13,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import tensorflow as tf
 from tensorflow.keras import layers
 import csv
+import joblib
 # Load and prepare data
 
 print("Loading data...")
@@ -187,7 +188,7 @@ print(f"Adjusted dataframe shape: {df.shape}")
 # Prepare data for model
 y = df['RF'].values
 X_mol2vec = [x for x in df['mol2vec']]  # List of (n_tokens, 300) arrays
-X_other = df.drop(['smiles','mol','RF','mol2vec'], axis=1).values
+X_other = df.drop(['smiles','mol','RF','mol2vec','H','EA','DCM','MeOH','Et2O'], axis=1).values
 
 X_other = np.concatenate([X_other, solvent_features], axis=1)
 # Normalize features
@@ -288,7 +289,7 @@ print("Training model...")
 history = model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
-    epochs=20,
+    epochs=50,
     batch_size=100,
     verbose=2,shuffle=True, validation_split=0.11
 )
@@ -325,3 +326,103 @@ plt.title('Prediction Performance')
 
 plt.tight_layout()
 plt.show()
+joblib.dump(scaler, 'scaler2.save')
+
+model.save('model_RF_5.keras')
+
+def predict_rf(smiles, eluent_percents):
+    # Load model and scaler
+    if os.path.exists('model_RF_4.keras'):
+        model = tf.keras.models.load_model('model_RF_5.keras')
+    else:
+        raise FileNotFoundError("Model not found. Please train the model first.")
+    
+    if os.path.exists('scaler.save'):
+        scaler = joblib.load('scaler2.save')
+    else:
+        raise FileNotFoundError("Scaler not found. Please train the model first to generate the scaler.")
+    
+    # Process input molecule
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("Invalid SMILES string")
+    mol = Chem.AddHs(mol)
+    
+    # Compute molecular descriptors (same as training)
+    descriptor_names = [
+        'num_atoms', 'num_heavy_atoms', 'num_C_atoms', 'num_O_atoms', 
+        'num_N_atoms', 'num_Cl_atoms', 'num_P_atoms', 'num_Br_atoms', 
+        'num_F_atoms', 'num_S_atoms', 'tpsa', 'mol_wt', 
+        'num_valence_electrons', 'num_heteroatoms', 'num_rotatablebonds',
+        'num_HDonors', 'num_HAcceptors', 'MolLogP'
+    ]
+    
+    mol_desc = {}
+    mol_desc['num_atoms'] = mol.GetNumAtoms()
+    mol_desc['num_heavy_atoms'] = mol.GetNumHeavyAtoms()
+    
+    atom_list = ['C','O','N','Cl','P','Br','F','S']
+    for atom in atom_list:
+        key = f'num_{atom}_atoms'
+        mol_desc[key] = len(mol.GetSubstructMatches(Chem.MolFromSmiles(atom)))
+    
+    mol_desc['tpsa'] = Descriptors.TPSA(mol)
+    mol_desc['mol_wt'] = Descriptors.ExactMolWt(mol)
+    mol_desc['num_valence_electrons'] = Descriptors.NumValenceElectrons(mol)
+    mol_desc['num_heteroatoms'] = Descriptors.NumHeteroatoms(mol)
+    mol_desc['num_rotatablebonds'] = Descriptors.NumRotatableBonds(mol)
+    mol_desc['num_HDonors'] = Descriptors.NumHDonors(mol)
+    mol_desc['num_HAcceptors'] = Descriptors.NumHAcceptors(mol)
+    mol_desc['MolLogP'] = Descriptors.MolLogP(mol)
+    
+    mol_desc_values = [mol_desc[name] for name in descriptor_names]
+    
+    # Process solvent properties (6 features)
+    eluents = ['CCCCCC','O=C(OCC)C','ClCCl','CO','CCOCC']
+    all_properties = []
+    for smi in eluents:
+        mol_e = Chem.MolFromSmiles(smi)
+        properties = [
+            Descriptors.TPSA(mol_e),
+            Descriptors.ExactMolWt(mol_e),
+            Descriptors.NumHDonors(mol_e),
+            Descriptors.NumHAcceptors(mol_e),
+            Descriptors.NumRotatableBonds(mol_e),
+            Descriptors.MolLogP(mol_e)
+        ]
+        all_properties.append(properties)
+
+    matrix_properties = np.array(all_properties).T
+    
+    solvent_features = np.sum(matrix_properties * np.array(eluent_percents), axis=1)
+    
+    all_features = np.concatenate([mol_desc_values, solvent_features])
+    
+    features_scaled = scaler.transform(all_features.reshape(1, -1))
+    
+    mol2vec_embedding = get_mol2vec_embeddings([mol], w2v_model)[0]
+    
+    max_len = 100
+    vec_dim = 100
+    
+    if len(mol2vec_embedding.shape) == 1:
+        mol2vec_embedding = mol2vec_embedding.reshape(1, -1)
+    
+    if mol2vec_embedding.shape[0] > max_len:
+        seq = mol2vec_embedding[:max_len]
+    else:
+        seq = np.zeros((max_len, vec_dim))
+        seq[:mol2vec_embedding.shape[0], :] = mol2vec_embedding
+    
+    other_features = features_scaled.reshape(-1, 1, features_scaled.shape[1])
+    other_padded = np.zeros((other_features.shape[0], 1, vec_dim))
+    other_padded[:, :, :other_features.shape[2]] = other_features
+    
+    final_input = np.concatenate([other_padded, seq.reshape(1, max_len, vec_dim)], axis=1)
+    
+    return model.predict(final_input)[0][0]
+
+smiles='O=C(OCC)C'
+eluients_percen=[0,1,0,0,0]
+rf_value = predict_rf(smiles,eluients_percen)
+print(f"Predicted RF: {rf_value:.4f}")
