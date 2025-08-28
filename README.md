@@ -1,1 +1,1 @@
-   Prediction of RF, KP (chromatographic retention factor HPLC), RT times (retention times). 
+   Prediction of RF, RT times (retention times). 
